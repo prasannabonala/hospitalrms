@@ -1,0 +1,1 @@
+This is the dummy certificate content for dr_txt.
