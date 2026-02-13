@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
 import io from 'socket.io-client';
 
-const socket = io('https://devon-efficiency-unable-visibility.trycloudflare.com');
-const API_BASE_URL = 'https://devon-efficiency-unable-visibility.trycloudflare.com';
+const socket = io('http://localhost:3000');
+const API_BASE_URL = 'http://localhost:3000';
 
 function App() {
   const [user, setUser] = useState(null);
@@ -459,7 +459,7 @@ function Dashboard({ user, onLogout }) {
                   <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '1rem' }}>
                     {u.certificate_path ? (
                       <a
-                        href={`${API_BASE_URL}/${u.certificate_path.replace(/\\/g, '/')}`}
+                        href={`${API_BASE_URL}/uploads/${u.certificate_path.split(/[\\/]/).pop()}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="auth-link"

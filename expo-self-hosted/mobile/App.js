@@ -16,7 +16,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import io from 'socket.io-client';
 
 // --- CONFIGURATION ---
-const API_BASE_URL = "https://devon-efficiency-unable-visibility.trycloudflare.com";
+const API_BASE_URL = "http://192.168.1.26:3000";
 const socket = io(API_BASE_URL);
 
 export default function App() {
