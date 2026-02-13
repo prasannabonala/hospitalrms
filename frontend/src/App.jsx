@@ -70,7 +70,7 @@ function RegisterForm({ onSwitchToLogin }) {
   const [password, setPassword] = useState('');
   const [phone, setPhone] = useState('');
   const [department, setDepartment] = useState('General Medicine');
-  const [role, setRole] = useState('staff');
+  const [role, setRole] = useState('nurse');
   const [certificate, setCertificate] = useState(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -148,7 +148,10 @@ function RegisterForm({ onSwitchToLogin }) {
           </select>
           <div style={{ display: 'flex', gap: '1rem', marginTop: '0.5rem' }}>
             <label style={{ color: 'white', display: 'flex', alignItems: 'center', gap: '5px' }}>
-              <input type="radio" name="role" value="staff" checked={role === 'staff'} onChange={e => setRole(e.target.value)} /> Staff
+              <input type="radio" name="role" value="nurse" checked={role === 'nurse'} onChange={e => setRole(e.target.value)} /> Nurse
+            </label>
+            <label style={{ color: 'white', display: 'flex', alignItems: 'center', gap: '5px' }}>
+              <input type="radio" name="role" value="head_nurse" checked={role === 'head_nurse'} onChange={e => setRole(e.target.value)} /> Head Nurse
             </label>
             <label style={{ color: 'white', display: 'flex', alignItems: 'center', gap: '5px' }}>
               <input type="radio" name="role" value="dept_head" checked={role === 'dept_head'} onChange={e => setRole(e.target.value)} /> Dept Head
@@ -179,10 +182,52 @@ function Dashboard({ user, onLogout }) {
   const [viewMode, setViewMode] = useState('overview');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
 
+  // Alert System State
+  const [alerts, setAlerts] = useState([]);
+  const [unreadAlerts, setUnreadAlerts] = useState(0);
+  const [showCreateAlert, setShowCreateAlert] = useState(false);
+  const [selectedAlert, setSelectedAlert] = useState(null);
+  const [toast, setToast] = useState(null); // { message, type }
+
   // Admin specific state
   const [adminUsers, setAdminUsers] = useState([]);
+  const [beds, setBeds] = useState([]);
+  const [equipment, setEquipment] = useState([]);
+  const [ots, setOts] = useState([]);
+  const [doctors, setDoctors] = useState([]);
+  const [nurses, setNurses] = useState([]);
 
   const isAdmin = user.role === 'admin';
+  console.log("Dashboard Render:", { userRole: user.role, isAdmin });
+
+  useEffect(() => {
+    const fetchDetailedResources = async () => {
+      try {
+        const [resBeds, resEquip, resOts] = await Promise.all([
+          fetch(`${API_BASE_URL}/api/beds`).then(r => r.json()),
+          fetch(`${API_BASE_URL}/api/equipment`).then(r => r.json()),
+          fetch(`${API_BASE_URL}/api/ots`).then(r => r.json())
+        ]);
+        setBeds(resBeds);
+        setEquipment(resEquip);
+        setOts(resOts);
+
+        // Fetch Human Resources
+        fetch(`${API_BASE_URL}/api/hr/doctors`).then(r => r.json()).then(setDoctors).catch(e => console.error(e));
+        fetch(`${API_BASE_URL}/api/hr/nurses`).then(r => r.json()).then(setNurses).catch(e => console.error(e));
+
+        if (isAdmin) {
+          fetch(`${API_BASE_URL}/api/admin/users`)
+            .then(res => res.json())
+            .then(data => setAdminUsers(data))
+            .catch(err => console.error("Failed to fetch users", err));
+        }
+      } catch (err) {
+        console.error("Failed to fetch detailed resources", err);
+      }
+    };
+    if (user) fetchDetailedResources();
+  }, [user, viewMode]);
 
   useEffect(() => {
     socket.on('connect', () => setIsConnected(true));
@@ -191,17 +236,73 @@ function Dashboard({ user, onLogout }) {
       setResources(prev => prev.map(r => r.id === updatedResource.id ? updatedResource : r));
     });
 
+    socket.on('bed_updated', (updatedBed) => {
+      setBeds(prev => prev.map(b => b.id === updatedBed.id ? updatedBed : b));
+    });
+
+    socket.on('equipment_updated', (updatedEquip) => {
+      setEquipment(prev => prev.map(e => e.id === updatedEquip.id ? updatedEquip : e));
+    });
+
+    socket.on('hr_update', ({ type, data }) => {
+      if (type === 'nurse') {
+        setNurses(prev => prev.map(n => n.id === data.id ? data : n));
+      } else if (type === 'doctor') {
+        setDoctors(prev => prev.map(d => d.id === data.id ? data : d));
+      }
+    });
+
+    // Alert Socket Listeners
+    socket.on('new_alert', (alert) => {
+      setAlerts(prev => [alert, ...prev]);
+      setUnreadAlerts(prev => prev + 1);
+      showToast(`New Critical Alert: ${alert.resource_name}`, 'critical');
+    });
+
+    socket.on('alert_verified', (alert) => {
+      if (isAdmin) {
+        setAlerts(prev => [alert, ...prev]);
+        setUnreadAlerts(prev => prev + 1);
+        showToast(`Escalated Alert: ${alert.resource_name}`, 'warning');
+      }
+    });
+
+    socket.on('alert_resolved', (alert) => {
+      setAlerts(prev => prev.map(a => a.id === alert.id ? alert : a));
+      showToast(`Alert Resolved: ${alert.resource_name}`, 'success');
+    });
+
     fetch(`${API_BASE_URL}/api/resources`)
       .then(res => res.json())
       .then(data => setResources(data))
       .catch(console.error);
 
+    // Fetch initial alerts based on role
+    const fetchAlerts = async () => {
+      let url = `${API_BASE_URL}/api/alerts/history`; // Default fallback
+      if (isAdmin) url = `${API_BASE_URL}/api/alerts/escalated`;
+      else if (user.role === 'dept_head') url = `${API_BASE_URL}/api/alerts/department/${user.department}`;
+      // Staff uses history for now, or we could filter client side
+
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          const data = await res.json();
+          setAlerts(data);
+        }
+      } catch (e) { console.error("Failed to fetch alerts", e); }
+    };
+    fetchAlerts();
+
     return () => {
       socket.off('connect');
       socket.off('disconnect');
       socket.off('resource_update');
+      socket.off('new_alert');
+      socket.off('alert_verified');
+      socket.off('alert_resolved');
     };
-  }, []);
+  }, [user, isAdmin]);
 
   // Fetch users if admin and in 'users' view
   useEffect(() => {
@@ -417,7 +518,17 @@ function Dashboard({ user, onLogout }) {
           <button className="close-btn" onClick={() => setIsMenuOpen(false)}>×</button>
         </div>
         <nav className="sidebar-nav">
-          {['overview', 'floor', 'ward', 'department'].map(mode => (
+          <button className={`menu-item ${viewMode === 'overview' ? 'active' : ''}`} onClick={() => { setViewMode('overview'); setIsMenuOpen(false); }}>Overview</button>
+
+          <div style={{ margin: '0.5rem 0', borderTop: '1px solid rgba(255,255,255,0.1)' }}></div>
+          <div style={{ paddingLeft: '1rem', color: 'var(--text-secondary)', fontSize: '0.8rem', marginBottom: '0.5rem' }}>RESOURCES</div>
+
+          <button className={`menu-item ${viewMode === 'beds' ? 'active' : ''}`} onClick={() => { setViewMode('beds'); setIsMenuOpen(false); }}>Beds Database</button>
+          <button className={`menu-item ${viewMode === 'equipment' ? 'active' : ''}`} onClick={() => { setViewMode('equipment'); setIsMenuOpen(false); }}>Equipment</button>
+          <button className={`menu-item ${viewMode === 'ots' ? 'active' : ''}`} onClick={() => { setViewMode('ots'); setIsMenuOpen(false); }}>Operation Theatres</button>
+
+          <div style={{ margin: '0.5rem 0', borderTop: '1px solid rgba(255,255,255,0.1)' }}></div>
+          {['floor', 'ward', 'department'].map(mode => (
             <button key={mode} className={`menu-item ${viewMode === mode ? 'active' : ''}`}
               onClick={() => { setViewMode(mode); setIsMenuOpen(false); }}>
               {mode} View
@@ -429,10 +540,31 @@ function Dashboard({ user, onLogout }) {
               User Requests
             </button>
           )}
+          {(isAdmin || user.role === 'dept_head') && (
+            <button className={`menu-item ${viewMode === 'hr' ? 'active' : ''}`}
+              onClick={() => { setViewMode('hr'); setIsMenuOpen(false); }}>
+              Human Resources
+            </button>
+          )}
+          <button className={`menu-item ${viewMode === 'alerts' ? 'active' : ''}`}
+            onClick={() => { setViewMode('alerts'); setIsMenuOpen(false); setUnreadAlerts(0); }}>
+            Alerts {unreadAlerts > 0 && <span className="badge badge-critical" style={{ marginLeft: '10px' }}>{unreadAlerts}</span>}
+          </button>
         </nav>
       </div>
 
       <div className="dashboard-content">
+        {viewMode === 'beds' && <BedTable beds={beds} isAdmin={isAdmin} user={user} />}
+        {viewMode === 'equipment' && <EquipmentTable equipment={equipment} isAdmin={isAdmin} user={user} />}
+        {viewMode === 'ots' && <OTTable ots={ots} isAdmin={isAdmin} />}
+
+        {viewMode === 'hr' && (isAdmin || user.role === 'dept_head') && (
+          <HumanResourcesView
+            doctors={doctors}
+            nurses={nurses}
+            user={user}
+          />
+        )}
         {viewMode === 'users' && isAdmin ? (
           <div className="admin-section">
             <h2>User Management</h2>
@@ -500,6 +632,12 @@ function Dashboard({ user, onLogout }) {
               ))}
             </div>
           </div>
+        ) : viewMode === 'alerts' ? (
+          <AlertList
+            alerts={alerts}
+            user={user}
+            onSelect={setSelectedAlert}
+          />
         ) : (
           viewMode === 'overview' ? (
             <div className="dashboard-grid">
@@ -519,6 +657,45 @@ function Dashboard({ user, onLogout }) {
           )
         )}
       </div>
+
+      {/* Alert Floating Button */}
+      <div className="floating-btn" onClick={() => setShowCreateAlert(true)} title="Raise Alert">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+      </div>
+
+      {showCreateAlert && (
+        <CreateAlertModal
+          user={user}
+          resources={resources}
+          onClose={() => setShowCreateAlert(false)}
+          onSuccess={(newAlert) => {
+            // If we're staff, we might want to add it to local list optimistically or wait for socket? 
+            // Socket goes to dept head. Staff needs to re-fetch or add local.
+            setAlerts(prev => [newAlert, ...prev]);
+            setShowCreateAlert(false);
+            showToast("Alert raised successfully", "success");
+          }}
+        />
+      )}
+
+      {selectedAlert && (
+        <AlertDetailModal
+          alert={selectedAlert}
+          user={user}
+          onClose={() => setSelectedAlert(null)}
+          onUpdate={(updatedAlert) => {
+            setAlerts(prev => prev.map(a => a.id === updatedAlert.id ? updatedAlert : a)); // Optimistic/Direct update
+          }}
+        />
+      )}
+
+      {toast && (
+        <ToastNotification
+          message={toast.message}
+          type={toast.type}
+          onClose={() => setToast(null)}
+        />
+      )}
 
       {((isAdmin && viewMode !== 'users') || (!isAdmin)) && (
         <div className="admin-section" style={{ marginTop: '3rem' }}>
@@ -639,6 +816,816 @@ function getHealthColorVar(current, total) {
   if (percentage <= 0.1) return 'var(--danger-color)';
   if (percentage <= 0.3) return 'var(--warning-color)';
   return 'var(--success-color)';
+}
+
+// --- Alert System Components ---
+
+function AlertList({ alerts, user, onSelect }) {
+  if (alerts.length === 0) {
+    return (
+      <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-secondary)' }}>
+        No alerts found.
+      </div>
+    );
+  }
+
+  return (
+    <div className="admin-list">
+      <h2>Alert History</h2>
+      {alerts.map(alert => (
+        <div key={alert.id} className={`alert-card ${alert.severity} admin-item`}
+          style={{ cursor: 'pointer', flexDirection: 'column', alignItems: 'stretch' }}
+          onClick={() => onSelect(alert)}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+            <span style={{ fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '10px' }}>
+              {alert.resource_name}
+              <span className={`badge badge-${alert.severity}`}>{alert.severity}</span>
+            </span>
+            <span className={`badge badge-${alert.status}`}>{alert.status}</span>
+          </div>
+          <p style={{ margin: '0 0 0.5rem 0' }}>{alert.message}</p>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+            <span>Raised by: {alert.raised_by_name} ({alert.raised_by_dept})</span>
+            <span>{new Date(alert.raised_at).toLocaleString()}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CreateAlertModal({ user, resources, onClose, onSuccess }) {
+  const [resourceId, setResourceId] = useState('');
+  const [severity, setSeverity] = useState('warning');
+  const [message, setMessage] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Filter resources to user's department
+  const myResources = resources.filter(r => r.department === user.department);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+
+    const resource = resources.find(r => r.id === parseInt(resourceId));
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/alerts/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          resourceId: resource ? resource.id : null,
+          resourceName: resource ? resource.name : 'General Alert',
+          alertType: resource ? 'threshold' : 'custom',
+          severity,
+          message,
+          thresholdValue: resource ? resource.available_count : null,
+          userId: user.id,
+          userName: user.username,
+          userDept: user.department
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      onSuccess({ ...data, raised_by: user.id, raised_at: new Date().toISOString() }); // Optimistic data for callback
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '1.5rem' }}>
+          <h2>Raise Alert</h2>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="auth-form" style={{ marginTop: 0 }}>
+          <label>Resource (Optional)</label>
+          <select
+            value={resourceId} onChange={e => setResourceId(e.target.value)}
+            style={{ padding: '0.75rem', borderRadius: '12px', background: 'var(--surface-hover)', color: 'white', border: '1px solid rgba(255,255,255,0.1)', width: '100%', marginBottom: '1rem' }}
+          >
+            <option value="">-- General / No Resource --</option>
+            {myResources.map(r => (
+              <option key={r.id} value={r.id}>{r.name} (Avl: {r.available_count})</option>
+            ))}
+          </select>
+
+          <label>Severity</label>
+          <select
+            value={severity} onChange={e => setSeverity(e.target.value)}
+            style={{ padding: '0.75rem', borderRadius: '12px', background: 'var(--surface-hover)', color: 'white', border: '1px solid rgba(255,255,255,0.1)', width: '100%', marginBottom: '1rem' }}
+          >
+            <option value="info">Info (Blue)</option>
+            <option value="warning">Warning (Yellow)</option>
+            <option value="critical">Critical (Red)</option>
+          </select>
+
+          <label>Message</label>
+          <textarea
+            required
+            value={message} onChange={e => setMessage(e.target.value)}
+            rows="4"
+            placeholder="Describe the issue..."
+            style={{ padding: '0.75rem', borderRadius: '12px', background: 'var(--surface-hover)', color: 'white', border: '1px solid rgba(255,255,255,0.1)', width: '100%', marginBottom: '1rem', fontFamily: 'inherit' }}
+          />
+
+          <button className="btn-primary" type="submit" disabled={isSubmitting}>
+            {isSubmitting ? 'Submitting...' : 'Raise Alert'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function AlertDetailModal({ alert, user, onClose, onUpdate }) {
+  const [notes, setNotes] = useState('');
+
+  const isDeptHead = user.role === 'dept_head' && user.department === alert.raised_by_dept;
+  const isAdmin = user.role === 'admin';
+
+  const handleVerify = async (action) => {
+    if (!notes.trim()) return window.alert("Please add notes before verifying.");
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/alerts/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          alertId: alert.id,
+          deptHeadId: user.id,
+          verificationNotes: notes,
+          action
+        })
+      });
+      if (res.ok) {
+        onUpdate({ ...alert, status: action === 'escalate' ? 'escalated' : 'dismissed', verification_notes: notes });
+        onClose();
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  const handleResolve = async (action) => {
+    if (!notes.trim()) return window.alert("Please add notes.");
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/alerts/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          alertId: alert.id,
+          adminId: user.id,
+          notes,
+          action
+        })
+      });
+      if (res.ok) {
+        onUpdate({ ...alert, status: 'resolved', admin_action: action, admin_notes: notes });
+        onClose();
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '1rem', alignItems: 'center' }}>
+          <h2 style={{ margin: 0 }}>Alert Details</h2>
+          <span className={`badge badge-${alert.status}`}>{alert.status}</span>
+        </div>
+
+        <div className="timeline">
+          <div className="timeline-item active">
+            <div className="timeline-dot"></div>
+            <strong>Raised by {alert.raised_by_name}</strong>
+            <div className="timeline-content">
+              <p style={{ margin: '0 0 5px 0' }}>{alert.message}</p>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{new Date(alert.raised_at).toLocaleString()}</span>
+            </div>
+          </div>
+
+          {(alert.status !== 'pending' || isDeptHead) && (
+            <div className={`timeline-item ${alert.status !== 'pending' ? 'active' : ''}`}>
+              <div className="timeline-dot"></div>
+              <strong>Department Verification</strong>
+              {alert.status === 'pending' && isDeptHead ? (
+                <div className="timeline-content">
+                  <textarea
+                    value={notes} onChange={e => setNotes(e.target.value)}
+                    placeholder="Verification notes..."
+                    style={{ width: '100%', marginTop: '0.5rem', padding: '0.5rem', background: 'var(--surface)', border: '1px solid rgba(255,255,255,0.1)', color: 'white' }}
+                  />
+                  <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
+                    <button className="btn-primary" onClick={() => handleVerify('escalate')}>Escalate to Admin</button>
+                    <button style={{ background: 'var(--surface)', color: 'white', padding: '0.5rem 1rem' }} onClick={() => handleVerify('dismiss')}>Dismiss</button>
+                  </div>
+                </div>
+              ) : (
+                alert.verification_notes && (
+                  <div className="timeline-content">
+                    <p>{alert.verification_notes}</p>
+                    <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{alert.verified_at ? new Date(alert.verified_at).toLocaleString() : ''}</span>
+                  </div>
+                )
+              )}
+            </div>
+          )}
+
+          {(alert.status === 'escalated' || alert.status === 'resolved') && (
+            <div className={`timeline-item ${alert.status === 'resolved' ? 'active' : ''}`}>
+              <div className="timeline-dot"></div>
+              <strong>Admin Resolution</strong>
+              {isAdmin && alert.status === 'escalated' ? (
+                <div className="timeline-content">
+                  <textarea
+                    value={notes} onChange={e => setNotes(e.target.value)}
+                    placeholder="Resolution notes..."
+                    style={{ width: '100%', marginTop: '0.5rem', padding: '0.5rem', background: 'var(--surface)', border: '1px solid rgba(255,255,255,0.1)', color: 'white' }}
+                  />
+                  <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
+                    <button className="btn-approve" style={{ background: 'var(--success-color)', color: 'white' }} onClick={() => handleResolve('approved')}>Approve</button>
+                    <button className="btn-reject" style={{ background: 'var(--danger-color)', color: 'white' }} onClick={() => handleResolve('rejected')}>Reject</button>
+                  </div>
+                </div>
+              ) : (
+                alert.admin_notes && (
+                  <div className="timeline-content">
+                    <p><strong>Decision: {alert.admin_action?.toUpperCase()}</strong></p>
+                    <p>{alert.admin_notes}</p>
+                    <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{alert.resolved_at ? new Date(alert.resolved_at).toLocaleString() : ''}</span>
+                  </div>
+                )
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ToastNotification({ message, type, onClose }) {
+  useEffect(() => {
+    const timer = setTimeout(onClose, 5000);
+    return () => clearTimeout(timer);
+  }, [onClose]);
+
+  const color = type === 'critical' ? 'var(--danger-color)' :
+    type === 'warning' ? 'var(--warning-color)' :
+      type === 'success' ? 'var(--success-color)' : 'var(--primary-color)';
+
+  return (
+    <div className="toast-container">
+      <div className="toast" style={{ borderLeft: `4px solid ${color}` }}>
+        <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: color }}></div>
+        <span>{message}</span>
+        <button onClick={onClose} style={{ background: 'transparent', marginLeft: 'auto', padding: 0 }}>×</button>
+      </div>
+    </div>
+  );
+}
+
+
+
+
+// --- New Detailed View Components ---
+
+function BedTable({ beds, isAdmin, user }) {
+  const [selectedType, setSelectedType] = useState(null);
+
+  // Group beds by type
+  const bedsByType = useMemo(() => {
+    const groups = {};
+    beds.forEach(bed => {
+      if (!groups[bed.type]) {
+        groups[bed.type] = { type: bed.type, count: 0, available: 0, beds: [] };
+      }
+      groups[bed.type].count++;
+      if (bed.status === 'available') groups[bed.type].available++;
+      groups[bed.type].beds.push(bed);
+    });
+    return Object.values(groups);
+  }, [beds]);
+
+  const handleToggleStatus = async (bed) => {
+    const newStatus = bed.status === 'available' ? 'occupied' : 'available';
+    try {
+      await fetch(`${API_BASE_URL}/api/beds/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: bed.id, status: newStatus })
+      });
+      // Verification via socket update
+    } catch (err) { console.error(err); }
+  };
+
+  const canToggle = user.role === 'nurse' || user.role === 'head_nurse';
+
+  if (!selectedType) {
+    return (
+      <div className="admin-section">
+        <h2>Beds Database</h2>
+        <div className="dashboard-grid">
+          {bedsByType.map(group => (
+            <div key={group.type} className="card" onClick={() => setSelectedType(group.type)} style={{ cursor: 'pointer' }}>
+              <div className="card-header">
+                <span className="card-title">{group.type}</span>
+                <div className={`status-indicator ${getHealthColor(group.available, group.count)}`}></div>
+              </div>
+              <div className="resource-value">{group.available}</div>
+              <div className="resource-total">/ {group.count} Available</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const filteredBeds = beds.filter(b => b.type === selectedType);
+
+  return (
+    <div className="admin-section">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
+        <button onClick={() => setSelectedType(null)} style={{ background: 'transparent', border: '1px solid var(--text-secondary)', color: 'var(--text-primary)', padding: '0.5rem 1rem', borderRadius: '8px', cursor: 'pointer' }}>
+          ← Back
+        </button>
+        <h2 style={{ margin: 0 }}>{selectedType} Beds</h2>
+      </div>
+      <table style={{ width: '100%', borderCollapse: 'collapse', color: 'var(--text-primary)' }}>
+        <thead>
+          <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.1)', textAlign: 'left' }}>
+            <th style={{ padding: '1rem' }}>ID</th>
+            <th style={{ padding: '1rem' }}>Department</th>
+            <th style={{ padding: '1rem' }}>Floor</th>
+            <th style={{ padding: '1rem' }}>Status</th>
+            {canToggle && <th style={{ padding: '1rem' }}>Action</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {filteredBeds.map(bed => (
+            <tr key={bed.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+              <td style={{ padding: '1rem' }}>{bed.name}</td>
+              <td style={{ padding: '1rem' }}>{bed.department}</td>
+              <td style={{ padding: '1rem' }}>{bed.floor}</td>
+              <td style={{ padding: '1rem' }}>
+                <span className={`badge badge-${bed.status === 'occupied' ? 'rejected' : 'approved'}`}>
+                  {bed.status.toUpperCase()}
+                </span>
+              </td>
+              {canToggle && (
+                <td style={{ padding: '1rem' }}>
+                  <button onClick={() => handleToggleStatus(bed)} style={{ fontSize: '0.8rem', padding: '0.25rem 0.5rem', background: 'var(--surface-hover)', cursor: 'pointer' }}>
+                    {bed.status === 'available' ? 'Mark Occupied' : 'Mark Available'}
+                  </button>
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function EquipmentTable({ equipment, isAdmin, user }) {
+  const [selectedType, setSelectedType] = useState(null);
+
+  const equipByType = useMemo(() => {
+    const groups = {};
+    equipment.forEach(item => {
+      if (!groups[item.type]) {
+        groups[item.type] = { type: item.type, count: 0, available: 0, items: [] };
+      }
+      groups[item.type].count++;
+      if (item.status === 'available') groups[item.type].available++;
+      groups[item.type].items.push(item);
+    });
+    return Object.values(groups);
+  }, [equipment]);
+
+  const handleToggleStatus = async (item) => {
+    const newStatus = item.status === 'available' ? 'in_use' : 'available';
+    try {
+      await fetch(`${API_BASE_URL}/api/equipment/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: item.id, status: newStatus })
+      });
+    } catch (err) { console.error(err); }
+  };
+
+  const canToggle = user.role === 'head_nurse';
+
+  if (!selectedType) {
+    return (
+      <div className="admin-section">
+        <h2>Equipment Inventory</h2>
+        <div className="dashboard-grid">
+          {equipByType.map(group => (
+            <div key={group.type} className="card" onClick={() => setSelectedType(group.type)} style={{ cursor: 'pointer' }}>
+              <div className="card-header">
+                <span className="card-title">{group.type}</span>
+                <div className={`status-indicator ${getHealthColor(group.available, group.count)}`}></div>
+              </div>
+              <div className="resource-value">{group.available}</div>
+              <div className="resource-total">/ {group.count} Available</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const filteredItems = equipment.filter(e => e.type === selectedType);
+
+  return (
+    <div className="admin-section">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
+        <button onClick={() => setSelectedType(null)} style={{ background: 'transparent', border: '1px solid var(--text-secondary)', color: 'var(--text-primary)', padding: '0.5rem 1rem', borderRadius: '8px', cursor: 'pointer' }}>
+          ← Back
+        </button>
+        <h2 style={{ margin: 0 }}>{selectedType} Details</h2>
+      </div>
+      <div className="dashboard-grid">
+        {filteredItems.map(item => (
+          <div key={item.id} className="card" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontWeight: 'bold' }}>{item.name}</span>
+              <span className={`badge badge-${item.status === 'available' ? 'approved' : 'warning'}`}>{item.status}</span>
+            </div>
+            <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Dept: {item.department}</div>
+            <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Service: {item.last_service_date || 'N/A'}</div>
+            <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Assigned: {item.assigned_to}</div>
+            {canToggle && (
+              <button onClick={() => handleToggleStatus(item)} style={{ marginTop: '0.5rem', background: 'var(--surface-hover)', padding: '0.5rem', borderRadius: '6px', cursor: 'pointer', border: 'none', color: 'white' }}>
+                {item.status === 'available' ? 'Mark In Use' : 'Mark Available'}
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function OTTable({ ots, isAdmin }) {
+  const [selectedSpecialty, setSelectedSpecialty] = useState(null);
+
+  const otBySpecialty = useMemo(() => {
+    const groups = {};
+    ots.forEach(ot => {
+      if (!groups[ot.specialty]) {
+        groups[ot.specialty] = { specialty: ot.specialty, count: 0, available: 0, items: [] };
+      }
+      groups[ot.specialty].count++;
+      if (ot.status === 'available') groups[ot.specialty].available++;
+      groups[ot.specialty].items.push(ot);
+    });
+    return Object.values(groups);
+  }, [ots]);
+
+  if (!selectedSpecialty) {
+    return (
+      <div className="admin-section">
+        <h2>Operation Theatres</h2>
+        <div className="dashboard-grid">
+          {otBySpecialty.map(group => (
+            <div key={group.specialty} className="card" onClick={() => setSelectedSpecialty(group.specialty)} style={{ cursor: 'pointer' }}>
+              <div className="card-header">
+                <span className="card-title">{group.specialty}</span>
+                <div className={`status-indicator ${getHealthColor(group.available, group.count)}`}></div>
+              </div>
+              <div className="resource-value">{group.available}</div>
+              <div className="resource-total">/ {group.count} Available</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const filteredOts = ots.filter(ot => ot.specialty === selectedSpecialty);
+
+  return (
+    <div className="admin-section">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
+        <button onClick={() => setSelectedSpecialty(null)} style={{ background: 'transparent', border: '1px solid var(--text-secondary)', color: 'var(--text-primary)', padding: '0.5rem 1rem', borderRadius: '8px', cursor: 'pointer' }}>
+          ← Back
+        </button>
+        <h2 style={{ margin: 0 }}>{selectedSpecialty} OTs</h2>
+      </div>
+      <div className="dashboard-grid">
+        {filteredOts.map(ot => (
+          <div key={ot.id} className="card">
+            <h3>{ot.name}</h3>
+            <div style={{ marginBottom: '1rem' }}>Status: <span className={`badge badge-${ot.status === 'available' ? 'approved' : 'rejected'}`}>{ot.status}</span></div>
+            {ot.next_scheduled_surgery && (
+              <div style={{ fontSize: '0.8rem', background: 'rgba(255,255,255,0.05)', padding: '0.5rem', borderRadius: '4px' }}>
+                Next: {new Date(ot.next_scheduled_surgery).toLocaleString()}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HumanResourcesView({ doctors, nurses, user }) {
+  const [activeTab, setActiveTab] = useState('doctors');
+
+  return (
+    <div className="admin-section">
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2rem' }}>
+        <h2>Human Resources</h2>
+        <div style={{ display: 'flex', gap: '1rem', background: 'var(--surface-hover)', padding: '0.5rem', borderRadius: '8px' }}>
+          <button
+            className={activeTab === 'doctors' ? 'btn-primary' : ''}
+            onClick={() => setActiveTab('doctors')}
+            style={{ padding: '0.5rem 1.5rem', borderRadius: '6px', background: activeTab === 'doctors' ? 'var(--primary-color)' : 'transparent', border: '1px solid transparent', color: 'white', cursor: 'pointer' }}
+          >
+            Doctors
+          </button>
+          <button
+            className={activeTab === 'nurses' ? 'btn-primary' : ''}
+            onClick={() => setActiveTab('nurses')}
+            style={{ padding: '0.5rem 1.5rem', borderRadius: '6px', background: activeTab === 'nurses' ? 'var(--primary-color)' : 'transparent', border: '1px solid transparent', color: 'white', cursor: 'pointer' }}
+          >
+            Nurses
+          </button>
+        </div>
+      </div>
+
+      {activeTab === 'doctors' ? (
+        <DoctorTable doctors={doctors} user={user} />
+      ) : (
+        <NurseTable nurses={nurses} user={user} />
+      )}
+    </div>
+  );
+}
+
+function DoctorTable({ doctors, user }) {
+  const isHRManager = user.role === 'admin' || user.role === 'dept_head';
+
+  const handleToggleAvailability = async (doc) => {
+    const newAvail = doc.availability === 'Yes' ? 'No' : 'Yes';
+    updateDoctor(doc.id, newAvail, doc.max_load);
+  };
+
+  const updateDoctor = async (id, availability, max_load) => {
+    try {
+      await fetch(`${API_BASE_URL}/api/hr/doctor/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, availability, max_load })
+      });
+    } catch (err) { console.error(err); }
+  };
+
+  const updateLoad = async (id, action) => {
+    try {
+      const endpoint = action === 'allocate' ? '/api/hr/doctor/allocate' : '/api/hr/doctor/release';
+      await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+    } catch (err) { console.error(err); }
+  };
+
+  return (
+    <div className="admin-list">
+      {doctors.map(doc => (
+        <div key={doc.id} className="admin-item" style={{ alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flex: 1 }}>
+            <div style={{ background: 'rgba(99, 102, 241, 0.1)', padding: '1rem', borderRadius: '12px', color: '#6366f1', fontWeight: 'bold' }}>
+              DR
+            </div>
+            <div>
+              <div style={{ fontSize: '1.1rem', fontWeight: 'bold' }}>{doc.name}</div>
+              <div style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+                {doc.dr_id} • <span style={{ color: 'white' }}>{doc.category}</span>
+              </div>
+              <div style={{ marginTop: '0.25rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                {doc.department} • <span className="badge badge-info" style={{ fontSize: '0.7rem' }}>{doc.shift}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Patient Allocation Section */}
+          <div style={{ flex: 1, padding: '0 2rem' }}>
+            {(() => {
+              const capacity = doc.max_load || 1;
+              const load = doc.current_load || 0;
+              const percent = Math.min((load / capacity) * 100, 100);
+              const isFull = load >= capacity;
+
+              return (
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '4px' }}>
+                    <span>Patient Load</span>
+                    <span style={{ color: isFull ? 'var(--danger-color)' : 'var(--text-secondary)' }}>
+                      {load} / {capacity}
+                    </span>
+                  </div>
+                  <div style={{ width: '100%', height: '6px', background: 'rgba(255,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' }}>
+                    <div style={{ width: `${percent}%`, height: '100%', background: isFull ? 'var(--danger-color)' : 'var(--primary-color)', transition: 'width 0.3s ease' }}></div>
+                  </div>
+                  {isHRManager && (
+                    <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem', justifyContent: 'center' }}>
+                      <button
+                        onClick={() => updateLoad(doc.id, 'release')}
+                        disabled={load <= 0}
+                        style={{ padding: '2px 8px', fontSize: '0.8rem', background: 'var(--surface-hover)', border: 'none', color: 'white', borderRadius: '4px', cursor: load > 0 ? 'pointer' : 'not-allowed', opacity: load > 0 ? 1 : 0.5 }}
+                      >
+                        -
+                      </button>
+                      <button
+                        onClick={() => updateLoad(doc.id, 'allocate')}
+                        disabled={isFull}
+                        style={{ padding: '2px 8px', fontSize: '0.8rem', background: 'var(--primary-color)', border: 'none', color: 'white', borderRadius: '4px', cursor: !isFull ? 'pointer' : 'not-allowed', opacity: !isFull ? 1 : 0.5 }}
+                      >
+                        +
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+
+          <div style={{ textAlign: 'right' }}>
+            {isHRManager ? (
+              <button
+                onClick={() => handleToggleAvailability(doc)}
+                className={`badge ${doc.availability === 'Yes' ? 'badge-approved' : 'badge-rejected'}`}
+                style={{ border: 'none', cursor: 'pointer', padding: '0.4rem 1rem' }}
+              >
+                {doc.availability === 'Yes' ? 'Available' : 'Unavailable'}
+              </button>
+            ) : (
+              <span className={`badge ${doc.availability === 'Yes' ? 'badge-approved' : 'badge-rejected'}`}>
+                {doc.availability === 'Yes' ? 'Available' : 'Unavailable'}
+              </span>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function NurseTable({ nurses, user }) {
+  const isHRManager = user.role === 'admin' || user.role === 'dept_head';
+  const [editingId, setEditingId] = useState(null);
+  const [editRatio, setEditRatio] = useState('');
+
+  const handleToggleAvailability = async (nurse) => {
+    const newAvail = nurse.availability === 'Yes' ? 'No' : 'Yes';
+    updateNurse(nurse.id, newAvail, nurse.ratio);
+  };
+
+  const startEditing = (nurse) => {
+    setEditingId(nurse.id);
+    setEditRatio(nurse.ratio);
+  };
+
+  const saveRatio = (nurse) => {
+    updateNurse(nurse.id, nurse.availability, editRatio);
+    setEditingId(null);
+  };
+
+  const updateNurse = async (id, availability, ratio) => {
+    try {
+      await fetch(`${API_BASE_URL}/api/hr/nurse/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, availability, ratio })
+      });
+    } catch (err) { console.error(err); }
+  };
+
+  const updateLoad = async (id, action) => {
+    try {
+      const endpoint = action === 'allocate' ? '/api/hr/nurse/allocate' : '/api/hr/nurse/release';
+      await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+    } catch (err) { console.error(err); }
+  };
+
+  return (
+    <div className="admin-list">
+      {nurses.map(nurse => (
+        <div key={nurse.id} className="admin-item" style={{ alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flex: 1 }}>
+            <div style={{ background: 'rgba(236, 72, 153, 0.1)', padding: '1rem', borderRadius: '12px', color: '#ec4899', fontWeight: 'bold' }}>
+              NS
+            </div>
+            <div>
+              <div style={{ fontSize: '1.1rem', fontWeight: 'bold' }}>{nurse.name}</div>
+              <div style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+                {nurse.emp_id} • <span style={{ color: 'white' }}>{nurse.category}</span>
+              </div>
+              <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                {nurse.department}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ flex: 1, padding: '0 2rem' }}>
+            {(() => {
+              const capacity = parseInt(nurse.ratio.split(':')[1]) || 1;
+              const load = nurse.current_load || 0;
+              const percent = Math.min((load / capacity) * 100, 100);
+              const isFull = load >= capacity;
+
+              return (
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '4px' }}>
+                    <span>Patient Load</span>
+                    <span style={{ color: isFull ? 'var(--danger-color)' : 'var(--text-secondary)' }}>
+                      {load} / {capacity}
+                    </span>
+                  </div>
+                  <div style={{ width: '100%', height: '6px', background: 'rgba(255,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' }}>
+                    <div style={{ width: `${percent}%`, height: '100%', background: isFull ? 'var(--danger-color)' : 'var(--primary-color)', transition: 'width 0.3s ease' }}></div>
+                  </div>
+                  {isHRManager && (
+                    <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem', justifyContent: 'center' }}>
+                      <button
+                        onClick={() => updateLoad(nurse.id, 'release')}
+                        disabled={load <= 0}
+                        style={{ padding: '2px 8px', fontSize: '0.8rem', background: 'var(--surface-hover)', border: 'none', color: 'white', borderRadius: '4px', cursor: load > 0 ? 'pointer' : 'not-allowed', opacity: load > 0 ? 1 : 0.5 }}
+                      >
+                        -
+                      </button>
+                      <button
+                        onClick={() => updateLoad(nurse.id, 'allocate')}
+                        disabled={isFull}
+                        style={{ padding: '2px 8px', fontSize: '0.8rem', background: 'var(--primary-color)', border: 'none', color: 'white', borderRadius: '4px', cursor: !isFull ? 'pointer' : 'not-allowed', opacity: !isFull ? 1 : 0.5 }}
+                      >
+                        +
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+
+          <div style={{ display: 'flex', gap: '2rem', alignItems: 'center' }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '4px' }}>RATIO</div>
+              {editingId === nurse.id ? (
+                <div style={{ display: 'flex', gap: '5px' }}>
+                  <input
+                    value={editRatio}
+                    onChange={e => setEditRatio(e.target.value)}
+                    style={{ width: '60px', padding: '0.25rem', marginBottom: 0, background: 'var(--surface)', border: '1px solid var(--primary-color)' }}
+                  />
+                  <button onClick={() => saveRatio(nurse)} style={{ padding: '0.25rem 0.5rem', fontSize: '0.8rem' }} className="btn-primary">✓</button>
+                </div>
+              ) : (
+                <div
+                  onClick={() => isHRManager && startEditing(nurse)}
+                  style={{ fontWeight: 'bold', fontSize: '1.1rem', cursor: isHRManager ? 'pointer' : 'default', borderBottom: isHRManager ? '1px dashed var(--text-secondary)' : 'none' }}
+                  title={isHRManager ? "Click to edit ratio" : ""}
+                >
+                  {nurse.ratio}
+                </div>
+              )}
+            </div>
+
+            <div style={{ textAlign: 'right' }}>
+              {isHRManager ? (
+                <button
+                  onClick={() => handleToggleAvailability(nurse)}
+                  className={`badge ${nurse.availability === 'Yes' ? 'badge-approved' : 'badge-rejected'}`}
+                  style={{ border: 'none', cursor: 'pointer', padding: '0.4rem 1rem' }}
+                >
+                  {nurse.availability === 'Yes' ? 'Available' : 'Unavailable'}
+                </button>
+              ) : (
+                <span className={`badge ${nurse.availability === 'Yes' ? 'badge-approved' : 'badge-rejected'}`}>
+                  {nurse.availability === 'Yes' ? 'Available' : 'Unavailable'}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
 }
 
 export default App;

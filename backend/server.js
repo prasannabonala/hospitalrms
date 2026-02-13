@@ -47,7 +47,22 @@ io.on('connection', (socket) => {
     socket.on('register_user', (userId) => {
         userSockets.set(userId, socket.id);
         console.log(`User ${userId} associated with socket ${socket.id}`);
-        // Notify others that this user is online (optional, not implementing full presence yet)
+
+        // Join rooms based on role and department
+        db.get('SELECT role, department FROM users WHERE id = ?', [userId], (err, user) => {
+            if (user) {
+                if (user.role === 'admin') {
+                    socket.join('admin_room');
+                    console.log(`Socket ${socket.id} joined admin_room`);
+                }
+                if (user.role === 'dept_head') {
+                    socket.join(`dept_head_${user.department}`);
+                    console.log(`Socket ${socket.id} joined dept_head_${user.department}`);
+                }
+                // Also join a personal room for targeted notifications
+                socket.join(`user_${userId}`);
+            }
+        });
     });
 
     socket.on('private_message', ({ to, content, from }) => {
@@ -150,7 +165,8 @@ app.post('/api/register', upload.single('certificate'), (req, res) => {
     console.log(`Registration attempt: ${username}, Phone: ${phone}, Role: ${role}`);
     const certificatePath = req.file ? req.file.path : null;
 
-    const finalRole = ['dept_head', 'staff'].includes(role) ? role : 'staff';
+    const validRoles = ['dept_head', 'staff', 'nurse', 'head_nurse'];
+    const finalRole = validRoles.includes(role) ? role : 'staff';
 
     db.run(`INSERT INTO users (username, password, department, phone, certificate_path, status, role) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
         [username, password, department, phone, certificatePath, finalRole], function (err) {
@@ -187,6 +203,153 @@ app.get('/api/admin/users', (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
         console.log(`Sending ${rows.length} users to admin. Sample phone: ${rows[0] ? rows[0].phone : 'none'}`);
         res.json(rows);
+    });
+});
+
+// --- Human Resources Routes ---
+
+app.get('/api/hr/doctors', (req, res) => {
+    db.all("SELECT * FROM doctors", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.get('/api/hr/nurses', (req, res) => {
+    db.all("SELECT * FROM nurses", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// Update Nurse Status (Availability/Ratio)
+app.post('/api/hr/nurse/update', (req, res) => {
+    const { id, availability, ratio } = req.body;
+
+    db.run(`UPDATE nurses SET availability = ?, ratio = ? WHERE id = ?`,
+        [availability, ratio, id],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Emit update for real-time
+            db.get('SELECT * FROM nurses WHERE id = ?', [id], (err, row) => {
+                if (!err && row) {
+                    io.emit('hr_update', { type: 'nurse', data: row });
+                }
+            });
+
+            res.json({ message: "Nurse updated successfully" });
+        }
+    );
+});
+
+// Allocate Patient to Nurse
+app.post('/api/hr/nurse/allocate', (req, res) => {
+    const { id } = req.body;
+    db.get('SELECT * FROM nurses WHERE id = ?', [id], (err, nurse) => {
+        if (err || !nurse) return res.status(404).json({ error: "Nurse not found" });
+
+        // Parse Ratio to get Capacity (e.g., "1:8" -> 8)
+        const capacity = parseInt(nurse.ratio.split(':')[1]) || 1;
+
+        if (nurse.current_load >= capacity) {
+            return res.status(400).json({ error: "Nurse is fully occupied" });
+        }
+
+        db.run('UPDATE nurses SET current_load = current_load + 1 WHERE id = ?', [id], function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Emit update
+            nurse.current_load += 1;
+            io.emit('hr_update', { type: 'nurse', data: nurse });
+            res.json({ message: "Patient allocated", nurse });
+        });
+    });
+});
+
+// Release Patient from Nurse
+app.post('/api/hr/nurse/release', (req, res) => {
+    const { id } = req.body;
+    db.get('SELECT * FROM nurses WHERE id = ?', [id], (err, nurse) => {
+        if (err || !nurse) return res.status(404).json({ error: "Nurse not found" });
+
+        if (nurse.current_load <= 0) {
+            return res.status(400).json({ error: "No patients to release" });
+        }
+
+        db.run('UPDATE nurses SET current_load = current_load - 1 WHERE id = ?', [id], function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Emit update
+            nurse.current_load -= 1;
+            io.emit('hr_update', { type: 'nurse', data: nurse });
+            res.json({ message: "Patient released", nurse });
+        });
+    });
+});
+
+
+
+// Update Doctor Status (Availability/Max Load)
+app.post('/api/hr/doctor/update', (req, res) => {
+    const { id, availability, max_load } = req.body;
+
+    db.run(`UPDATE doctors SET availability = ?, max_load = ? WHERE id = ?`,
+        [availability, max_load, id],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Emit update for real-time
+            db.get('SELECT * FROM doctors WHERE id = ?', [id], (err, row) => {
+                if (!err && row) {
+                    io.emit('hr_update', { type: 'doctor', data: row });
+                }
+            });
+
+            res.json({ message: "Doctor updated successfully" });
+        }
+    );
+});
+
+// Allocate Patient to Doctor
+app.post('/api/hr/doctor/allocate', (req, res) => {
+    const { id } = req.body;
+    db.get('SELECT * FROM doctors WHERE id = ?', [id], (err, doc) => {
+        if (err || !doc) return res.status(404).json({ error: "Doctor not found" });
+
+        if (doc.current_load >= doc.max_load) {
+            return res.status(400).json({ error: "Doctor is fully occupied" });
+        }
+
+        db.run('UPDATE doctors SET current_load = current_load + 1 WHERE id = ?', [id], function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Emit update
+            doc.current_load += 1;
+            io.emit('hr_update', { type: 'doctor', data: doc });
+            res.json({ message: "Patient allocated", doc });
+        });
+    });
+});
+
+// Release Patient from Doctor
+app.post('/api/hr/doctor/release', (req, res) => {
+    const { id } = req.body;
+    db.get('SELECT * FROM doctors WHERE id = ?', [id], (err, doc) => {
+        if (err || !doc) return res.status(404).json({ error: "Doctor not found" });
+
+        if (doc.current_load <= 0) {
+            return res.status(400).json({ error: "No patients to release" });
+        }
+
+        db.run('UPDATE doctors SET current_load = current_load - 1 WHERE id = ?', [id], function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Emit update
+            doc.current_load -= 1;
+            io.emit('hr_update', { type: 'doctor', data: doc });
+            res.json({ message: "Patient released", doc });
+        });
     });
 });
 
@@ -249,6 +412,119 @@ app.post('/api/admin/remove', (req, res) => {
     });
 });
 
+// --- Alert System Routes ---
+
+// 1. Create Alert (Staff)
+app.post('/api/alerts/create', (req, res) => {
+    const { resourceId, resourceName, alertType, severity, message, thresholdValue, userId, userName, userDept } = req.body;
+
+    db.run(`INSERT INTO alerts (
+        resource_id, resource_name, alert_type, severity, message, threshold_value,
+        raised_by, raised_by_name, raised_by_dept
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [resourceId, resourceName, alertType, severity, message, thresholdValue, userId, userName, userDept],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            const alertId = this.lastID;
+
+            // Fetch full alert to emit
+            db.get('SELECT * FROM alerts WHERE id = ?', [alertId], (err, alert) => {
+                if (!err && alert) {
+                    // Notify Dept Heads of that department
+                    io.to(`dept_head_${userDept}`).emit('new_alert', alert);
+                }
+            });
+
+            res.json({ message: "Alert raised successfully", alertId });
+        });
+});
+
+// 2. Get Alerts for Department Head
+app.get('/api/alerts/department/:department', (req, res) => {
+    const department = req.params.department;
+    db.all(`SELECT * FROM alerts WHERE raised_by_dept = ? ORDER BY raised_at DESC`, [department], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// 3. Verify Alert (Department Head)
+app.post('/api/alerts/verify', (req, res) => {
+    const { alertId, deptHeadId, verificationNotes, action } = req.body; // action: 'escalate' | 'dismiss'
+    const status = action === 'escalate' ? 'escalated' : 'dismissed';
+    const now = new Date().toISOString();
+
+    db.run(`UPDATE alerts SET 
+        status = ?, 
+        dept_head_id = ?, 
+        verification_notes = ?, 
+        verified_at = ? 
+        WHERE id = ?`,
+        [status, deptHeadId, verificationNotes, now, alertId],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            if (action === 'escalate') {
+                db.get('SELECT * FROM alerts WHERE id = ?', [alertId], (err, alert) => {
+                    if (!err && alert) {
+                        // Notify Admins
+                        io.to('admin_room').emit('alert_verified', alert);
+                    }
+                });
+            }
+
+            res.json({ message: `Alert ${status}` });
+        });
+});
+
+// 4. Get Escalated Alerts (Admin)
+app.get('/api/alerts/escalated', (req, res) => {
+    db.all(`SELECT * FROM alerts WHERE status = 'escalated' ORDER BY verified_at DESC`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// 5. Resolve Alert (Admin)
+app.post('/api/alerts/resolve', (req, res) => {
+    const { alertId, adminId, action, notes } = req.body; // action: 'approved' | 'rejected'
+    const status = 'resolved'; // Final status is resolved, but we track the decision in admin_action
+    const now = new Date().toISOString();
+
+    db.run(`UPDATE alerts SET 
+        status = ?, 
+        admin_id = ?, 
+        admin_action = ?, 
+        admin_notes = ?, 
+        resolved_at = ? 
+        WHERE id = ?`,
+        [status, adminId, action, notes, now, alertId],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            db.get('SELECT * FROM alerts WHERE id = ?', [alertId], (err, alert) => {
+                if (!err && alert) {
+                    // Notify Dept Head ONLY (as per user request)
+                    if (alert.dept_head_id) {
+                        io.to(`user_${alert.dept_head_id}`).emit('alert_resolved', alert);
+                    }
+                }
+            });
+
+            res.json({ message: "Alert resolved" });
+        });
+});
+
+// 6. Get Alert History (Generic search/filter)
+app.get('/api/alerts/history', (req, res) => {
+    // Simple all alerts fetch for now, can be filtered by frontend
+    db.all(`SELECT * FROM alerts ORDER BY raised_at DESC`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
 // --- Chat Routes ---
 
 // Get all approved users for chat list (excluding self potentially, managed by frontend)
@@ -275,6 +551,69 @@ app.get('/api/messages/:contactId', (req, res) => {
             if (err) return res.status(500).json({ error: err.message });
             res.json(rows);
         });
+});
+
+// --- Detailed Resource Routes ---
+
+// 1. Beds
+app.get('/api/beds', (req, res) => {
+    db.all("SELECT * FROM beds", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.post('/api/beds/update', (req, res) => {
+    const { id, status } = req.body;
+    db.run("UPDATE beds SET status = ? WHERE id = ?", [status, id], function (err) {
+        if (err) return res.status(500).json({ error: err.message });
+
+        // Fetch updated row to broadcast
+        db.get("SELECT * FROM beds WHERE id = ?", [id], (err, row) => {
+            if (row) io.emit('bed_updated', row);
+        });
+
+        res.json({ message: "Bed status updated" });
+    });
+});
+
+// 2. Equipment
+app.get('/api/equipment', (req, res) => {
+    db.all("SELECT * FROM equipment", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.post('/api/equipment/update', (req, res) => {
+    const { id, status, assignment } = req.body; // assignment could be patient ID etc.
+    // Simple status update for now, can extend
+    db.run("UPDATE equipment SET status = ?, assigned_to = ? WHERE id = ?", [status, assignment || 'None', id], function (err) {
+        if (err) return res.status(500).json({ error: err.message });
+
+        // Fetch updated row to broadcast
+        db.get("SELECT * FROM equipment WHERE id = ?", [id], (err, row) => {
+            if (row) io.emit('equipment_updated', row);
+        });
+
+        res.json({ message: "Equipment status updated" });
+    });
+});
+
+// 3. Operation Theatres
+app.get('/api/ots', (req, res) => {
+    db.all("SELECT * FROM operation_theatres", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.post('/api/ots/update', (req, res) => {
+    const { id, status, next_surgery } = req.body;
+    db.run("UPDATE operation_theatres SET status = ?, next_scheduled_surgery = ? WHERE id = ?", [status, next_surgery, id], function (err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: "OT status updated" });
+    });
 });
 
 server.listen(PORT, () => {
